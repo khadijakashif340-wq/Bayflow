@@ -1,0 +1,546 @@
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ----------------------------------------------------
+// ENUMS
+// ----------------------------------------------------
+
+enum UserType {
+  CUSTOMER
+  OWNER
+  STAFF
+}
+
+enum ShopRole {
+  OWNER
+  SERVICE_ADVISOR
+  TECHNICIAN
+  PARTS_PERSON
+  QC_INSPECTOR
+}
+
+enum AuditRole {
+  CUSTOMER
+  OWNER
+  SERVICE_ADVISOR
+  TECHNICIAN
+  PARTS_PERSON
+  QC_INSPECTOR
+  SYSTEM
+}
+
+enum BookingStatus {
+  PENDING
+  CONFIRMED
+  ASSIGNED
+  INSPECTING
+  ESTIMATE_REVIEW
+  AWAITING_CUSTOMER
+  ESTIMATE_APPROVED
+  ESTIMATE_REJECTED
+  PARTS_PENDING
+  PARTS_ORDERED
+  PARTS_READY
+  IN_REPAIR
+  QC_PENDING
+  QC_IN_PROGRESS
+  READY_FOR_PICKUP
+  COMPLETED
+  CANCELLED
+}
+
+enum EstimateStatus {
+  DRAFT
+  SENT
+  APPROVED
+  REJECTED
+  SUPERSEDED
+}
+
+enum EstimateItemType {
+  PART
+  LABOR
+}
+
+enum AllocationStatus {
+  ALLOCATED
+  CONSUMED
+  RELEASED
+}
+
+enum POStatus {
+  ORDERED
+  PARTIALLY_RECEIVED
+  RECEIVED
+  CANCELLED
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum TaskStatus {
+  PENDING
+  IN_PROGRESS
+  DONE
+}
+
+// ----------------------------------------------------
+// CORE USERS & MULTI-TENANCY
+// ----------------------------------------------------
+
+model User {
+  id             String       @id @default(uuid())
+  email          String       @unique
+  passwordHash   String
+  name           String
+  phone          String?
+  userType       UserType     @default(CUSTOMER) // Platform role distinction only
+  avatarUrl      String?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  ownedShops     Shop[]       @relation("ShopOwner")
+  memberships    ShopMember[] // Shop roles live strictly on ShopMember
+  bookings       Booking[]    @relation("CustomerBookings")
+  assignedTechs  Booking[]    @relation("TechnicianBookings")
+  assignedSAs    Booking[]    @relation("AdvisorBookings")
+  assignedParts  Booking[]    @relation("PartsPersonBookings")
+  assignedQCs    Booking[]    @relation("QCBookings")
+  auditLogs      BookingAuditLog[]
+  notifications  Notification[]
+  qcIssuesRaised QCIssue[]    @relation("QCIssueRaisedBy")
+  callsMade      CallLog[]    @relation("CallsMade")
+  callsReceived  CallLog[]    @relation("CallsReceived")
+  assignedTasks  AITask[]
+
+  @@index([email])
+}
+
+model Shop {
+  id                  String       @id @default(uuid())
+  name                String
+  slug                String       @unique
+  description         String?
+  address             String
+  city                String       // Karachi, Lahore, Islamabad, etc.
+  phone               String
+  email               String
+  openTime            String       @default("09:00") // Working hours
+  closeTime           String       @default("19:00")
+  workingDays         String       @default("Monday - Saturday")
+  maxParallelSlots    Int          @default(4)
+  slotDurationMinutes Int          @default(60)
+  ownerId             String
+  owner               User         @relation("ShopOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  createdAt           DateTime     @default(now())
+  updatedAt           DateTime     @updatedAt
+
+  members             ShopMember[]
+  services            Service[]
+  slots               BookingSlot[]
+  bookings            Booking[]
+  estimates           Estimate[]
+  parts               Part[]
+  partAllocations     PartAllocation[]
+  purchaseOrders      PurchaseOrder[]
+  notifications       Notification[]
+  auditLogs           BookingAuditLog[]
+  qcIssues            QCIssue[]
+  callLogs            CallLog[]
+  aiCallLogs          AICallLog[]
+  aiTasks             AITask[]
+
+  @@index([city])
+  @@index([ownerId])
+}
+
+model ShopMember {
+  id        String   @id @default(uuid())
+  shopId    String
+  userId    String
+  role      ShopRole // OWNER, SERVICE_ADVISOR, TECHNICIAN, PARTS_PERSON, QC_INSPECTOR
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  shop      Shop     @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([shopId, userId])
+  @@index([shopId])
+  @@index([userId])
+}
+
+// ----------------------------------------------------
+// SERVICE CATALOG & CALENDAR SLOTS
+// ----------------------------------------------------
+
+model Service {
+  id              String           @id @default(uuid())
+  shopId          String
+  name            String
+  description     String
+  category        String           // Maintenance, Diagnostics, Brakes, Suspension, AC
+  durationMinutes Int              @default(60)
+  basePrice       Decimal          @db.Decimal(10, 2) // In PKR
+  isActive        Boolean          @default(true)
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  shop            Shop             @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  bookingServices BookingService[]
+
+  @@index([shopId])
+}
+
+model BookingSlot {
+  id          String    @id @default(uuid())
+  shopId      String
+  startTime   DateTime
+  endTime     DateTime
+  capacity    Int       @default(4)
+  bookedCount Int       @default(0)
+  isBlocked   Boolean   @default(false)
+
+  shop        Shop      @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  bookings    Booking[]
+
+  @@unique([shopId, startTime])
+  @@index([shopId, startTime])
+}
+
+// ----------------------------------------------------
+// BOOKINGS & WORK ORDERS
+// ----------------------------------------------------
+
+model Booking {
+  id                    String            @id @default(uuid())
+  bookingNumber         String            @unique // e.g. "BF-2026-1001"
+  shopId                String
+  customerId            String
+  slotId                String?
+  status                BookingStatus     @default(PENDING)
+  
+  // Vehicle details
+  vehicleMake           String
+  vehicleModel          String
+  vehicleYear           Int
+  vehicleVin            String?
+  licensePlate          String            // JetBrains Mono in UI
+  mileage               Int?
+  
+  customerNotes         String?
+  internalNotes         String?
+  
+  assignedAdvisorId     String?
+  assignedTechnicianId  String?
+  assignedPartsPersonId String?
+  qcInspectorId         String?
+  
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+
+  shop                  Shop              @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  customer              User              @relation("CustomerBookings", fields: [customerId], references: [id], onDelete: Cascade)
+  slot                  BookingSlot?      @relation(fields: [slotId], references: [id], onDelete: SetNull)
+  assignedAdvisor       User?             @relation("AdvisorBookings", fields: [assignedAdvisorId], references: [id])
+  assignedTechnician    User?             @relation("TechnicianBookings", fields: [assignedTechnicianId], references: [id])
+  assignedPartsPerson   User?             @relation("PartsPersonBookings", fields: [assignedPartsPersonId], references: [id])
+  qcInspector           User?             @relation("QCBookings", fields: [qcInspectorId], references: [id])
+
+  services              BookingService[]
+  estimates             Estimate[]
+  auditLogs             BookingAuditLog[]
+  partAllocations       PartAllocation[]
+  qcIssues              QCIssue[]
+  callLogs              CallLog[]
+  aiCallLogs            AICallLog[]
+  aiTasks               AITask[]
+  notifications         Notification[]
+
+  @@index([shopId, status])
+  @@index([customerId])
+  @@index([licensePlate])
+}
+
+model BookingService {
+  id        String   @id @default(uuid())
+  bookingId String
+  serviceId String
+  price     Decimal  @db.Decimal(10, 2) // In PKR
+
+  booking   Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  service   Service  @relation(fields: [serviceId], references: [id], onDelete: Restrict)
+
+  @@index([bookingId])
+  @@index([serviceId])
+}
+
+model BookingAuditLog {
+  id            String        @id @default(uuid())
+  bookingId     String
+  shopId        String
+  fromStatus    BookingStatus
+  toStatus      BookingStatus
+  performedById String
+  role          AuditRole     // Supports CUSTOMER, OWNER, SERVICE_ADVISOR, TECHNICIAN, etc.
+  note          String?
+  createdAt     DateTime      @default(now())
+
+  booking       Booking       @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  shop          Shop          @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  performedBy   User          @relation(fields: [performedById], references: [id])
+
+  @@index([bookingId])
+  @@index([shopId])
+}
+
+// ----------------------------------------------------
+// QC ISSUES (FAILED QC LOOP MODEL)
+// ----------------------------------------------------
+
+model QCIssue {
+  id          String    @id @default(uuid())
+  shopId      String
+  bookingId   String
+  title       String
+  description String    @db.Text
+  raisedById  String
+  resolved    Boolean   @default(false)
+  resolvedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  shop        Shop      @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  booking     Booking   @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  raisedBy    User      @relation("QCIssueRaisedBy", fields: [raisedById], references: [id])
+
+  @@index([shopId])
+  @@index([bookingId])
+}
+
+// ----------------------------------------------------
+// ESTIMATES (PKR, OPTIONAL TAX DEFAULT 0)
+// ----------------------------------------------------
+
+model Estimate {
+  id              String         @id @default(uuid())
+  bookingId       String
+  shopId          String
+  revision        Int            @default(1)
+  status          EstimateStatus @default(DRAFT)
+  subtotalParts   Decimal        @default(0.00) @db.Decimal(10, 2)
+  subtotalLabor   Decimal        @default(0.00) @db.Decimal(10, 2)
+  taxRate         Decimal        @default(0.0000) @db.Decimal(5, 4) // Tax optional, default 0
+  taxAmount       Decimal        @default(0.00) @db.Decimal(10, 2)
+  total           Decimal        @default(0.00) @db.Decimal(10, 2) // In PKR
+  notes           String?
+  rejectionReason String?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  booking         Booking        @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  shop            Shop           @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  items           EstimateItem[]
+
+  @@index([bookingId, revision])
+  @@index([shopId])
+}
+
+model EstimateItem {
+  id          String           @id @default(uuid())
+  estimateId  String
+  partId      String?
+  itemType    EstimateItemType // PART or LABOR
+  description String
+  quantity    Decimal          @default(1.0) @db.Decimal(8, 2)
+  unitPrice   Decimal          @db.Decimal(10, 2)
+  total       Decimal          @db.Decimal(10, 2) // Computed server-side: quantity * unitPrice
+
+  estimate    Estimate         @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+  part        Part?            @relation(fields: [partId], references: [id], onDelete: SetNull)
+
+  @@index([estimateId])
+}
+
+// ----------------------------------------------------
+// INVENTORY & PURCHASE ORDERS
+// ----------------------------------------------------
+
+model Part {
+  id                String              @id @default(uuid())
+  shopId            String
+  sku               String              // Unique per shop
+  name              String
+  description       String?
+  category          String
+  unitPrice         Decimal             @db.Decimal(10, 2) // Selling price (PKR)
+  costPrice         Decimal             @db.Decimal(10, 2) // Cost price (PKR)
+  quantityInStock   Int                 @default(0)
+  quantityAllocated Int                 @default(0)
+  minStockLevel     Int                 @default(5)
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+
+  shop              Shop                @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  allocations       PartAllocation[]
+  estimateItems     EstimateItem[]
+  poItems           PurchaseOrderItem[]
+
+  @@unique([shopId, sku])
+  @@index([shopId])
+}
+
+model PartAllocation {
+  id        String           @id @default(uuid())
+  shopId    String
+  bookingId String
+  partId    String
+  quantity  Int              @default(1)
+  status    AllocationStatus @default(ALLOCATED)
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @updatedAt
+
+  shop      Shop             @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  booking   Booking          @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  part      Part             @relation(fields: [partId], references: [id], onDelete: Restrict)
+
+  @@index([shopId])
+  @@index([bookingId])
+  @@index([partId])
+}
+
+model PurchaseOrder {
+  id             String              @id @default(uuid())
+  shopId         String
+  poNumber       String              // e.g. "PO-2026-001"
+  supplierName   String
+  status         POStatus            @default(ORDERED)
+  totalCost      Decimal             @default(0.00) @db.Decimal(10, 2) // In PKR
+  notes          String?
+  createdAt      DateTime            @default(now())
+  updatedAt      DateTime            @updatedAt
+
+  shop           Shop                @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  items          PurchaseOrderItem[]
+
+  @@unique([shopId, poNumber])
+  @@index([shopId])
+}
+
+model PurchaseOrderItem {
+  id               String        @id @default(uuid())
+  purchaseOrderId  String
+  partId           String
+  quantityOrdered  Int
+  quantityReceived Int           @default(0)
+  unitCost         Decimal       @db.Decimal(10, 2) // In PKR
+
+  purchaseOrder    PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  part             Part          @relation(fields: [partId], references: [id], onDelete: Restrict)
+
+  @@index([purchaseOrderId])
+}
+
+// ----------------------------------------------------
+// CALL LOGS & NOTIFICATIONS
+// ----------------------------------------------------
+
+model CallLog {
+  id         String   @id @default(uuid())
+  shopId     String
+  bookingId  String?
+  fromUserId String
+  toUserId   String
+  startedAt  DateTime @default(now())
+  duration   Int      // in seconds
+  outcome    String
+  createdAt  DateTime @default(now())
+
+  shop       Shop     @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  booking    Booking? @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+  fromUser   User     @relation("CallsMade", fields: [fromUserId], references: [id])
+  toUser     User     @relation("CallsReceived", fields: [toUserId], references: [id])
+
+  @@index([shopId])
+  @@index([bookingId])
+  @@index([fromUserId])
+  @@index([toUserId])
+}
+
+model Notification {
+  id        String    @id @default(uuid())
+  shopId    String
+  userId    String?
+  role      ShopRole? // Target role within shop
+  title     String
+  message   String
+  type      String    // e.g. "BOOKING_CREATED", "ESTIMATE_APPROVED", "QC_FAILED"
+  read      Boolean   @default(false)
+  bookingId String?
+  link      String?
+  createdAt DateTime  @default(now())
+
+  shop      Shop      @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  user      User?     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  booking   Booking?  @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+
+  @@index([shopId, read])
+  @@index([userId, read])
+}
+
+// ----------------------------------------------------
+// BONUS: AI FRONT DESK (SERVER-SIDE OPENROUTER)
+// ----------------------------------------------------
+
+model AICallLog {
+  id              String   @id @default(uuid())
+  shopId          String
+  bookingId       String?
+  callerPhone     String?
+  callerName      String?
+  transcript      String   @db.Text
+  summary         String   @db.Text
+  durationSeconds Int      @default(0)
+  createdAt       DateTime @default(now())
+
+  shop            Shop     @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  booking         Booking? @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+  tasks           AITask[]
+
+  @@index([shopId])
+  @@index([bookingId])
+}
+
+model AITask {
+  id           String       @id @default(uuid())
+  shopId       String
+  bookingId    String?
+  callLogId    String?
+  title        String
+  description  String       @db.Text
+  priority     TaskPriority @default(MEDIUM)
+  status       TaskStatus   @default(PENDING)
+  assignedToId String?
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  shop         Shop         @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  booking      Booking?     @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+  callLog      AICallLog?   @relation(fields: [callLogId], references: [id], onDelete: SetNull)
+  assignedTo   User?        @relation(fields: [assignedToId], references: [id], onDelete: SetNull)
+
+  @@index([shopId, status])
+  @@index([bookingId])
+}
