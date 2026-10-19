@@ -1,4 +1,4 @@
-# BayFlow (بائے فلو) — Auto Repair Shop Operating System
+# BayFlow — Auto Repair Shop Operating System
 
 > **A production-grade, multi-tenant workshop operating system purpose-built for Pakistan’s automotive repair industry.**
 
